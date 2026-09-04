@@ -1,5 +1,6 @@
 import os, time, threading, requests, numpy as np, pandas as pd
 from collections import defaultdict
+from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
@@ -114,6 +115,11 @@ last_bar = {}
 seen = set()
 last_alert = {}
 stats = defaultdict(int)
+
+OPTIONS_AVAILABLE = False
+OPTIONS_LAST_ERROR = ""
+OPTIONS_LAST_CHECK = 0
+OPTIONS_DISCOVERY_MIN = int(os.getenv("OPTIONS_DISCOVERY_MIN", "30"))
 
 # ------------------------------------------------------------
 # Telegram
@@ -289,7 +295,7 @@ def fmt(x):
 # Discover Binance Options
 # ------------------------------------------------------------
 
-def discover_option_contracts():
+def _discover_option_contracts():
     global contracts, spot_symbols, asset_name
 
     info = get_json(f"{OPT_BASE}/eapi/v1/exchangeInfo")
@@ -340,6 +346,30 @@ def discover_option_contracts():
         else:
             print(asset, "SKIPPED - no active Binance option contract currently listed")
     print("==================================================\n")
+
+def discover_option_contracts():
+    """Safe wrapper: HTTP 451/403/429 from Binance Options must not crash Render."""
+    global OPTIONS_AVAILABLE, OPTIONS_LAST_ERROR, OPTIONS_LAST_CHECK
+    OPTIONS_LAST_CHECK = time.time()
+    try:
+        result = _discover_option_contracts()
+        OPTIONS_AVAILABLE = True
+        OPTIONS_LAST_ERROR = ""
+        return result
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        body = e.response.text[:300] if e.response is not None else str(e)
+        OPTIONS_AVAILABLE = False
+        OPTIONS_LAST_ERROR = f"Binance Options HTTP {status}"
+        contracts.clear()
+        print("BINANCE OPTIONS UNAVAILABLE:", OPTIONS_LAST_ERROR, body)
+        return False
+    except Exception as e:
+        OPTIONS_AVAILABLE = False
+        OPTIONS_LAST_ERROR = f"Binance Options error: {str(e)[:250]}"
+        contracts.clear()
+        print("BINANCE OPTIONS UNAVAILABLE:", OPTIONS_LAST_ERROR)
+        return False
 
 # ------------------------------------------------------------
 # Spot history
@@ -885,7 +915,7 @@ def analyze_asset(asset):
             }
 
     # Confirmed option signal.
-    if signal:
+    if signal and OPTIONS_AVAILABLE:
         market = build_option_market()
 
         option = select_option(
@@ -917,7 +947,7 @@ def analyze_asset(asset):
                 stats["confirmed"] += 1
 
     # Early option watch.
-    if early_l or early_s:
+    if OPTIONS_AVAILABLE and (early_l or early_s):
         side = "LONG" if early_l else "SHORT"
         sc = score(c, side, False)
 
@@ -951,8 +981,17 @@ def analyze_asset(asset):
 # ------------------------------------------------------------
 
 def scan_loop():
+    last_discovery = 0
     while True:
-        for asset in list(contracts.keys()):
+        if (not OPTIONS_AVAILABLE) or (time.time() - last_discovery >= OPTIONS_DISCOVERY_MIN * 60):
+            discover_option_contracts()
+            last_discovery = time.time()
+
+        scan_assets = list(contracts.keys())
+        if not scan_assets:
+            scan_assets = list(spot_symbols.keys())
+
+        for asset in scan_assets:
             try:
                 symbol = spot_symbols[asset]
 
@@ -1035,7 +1074,10 @@ def health():
         },
         "confirmed": stats["confirmed"],
         "early": stats["early"],
-        "errors": stats["errors"]
+        "errors": stats["errors"],
+        "options_available": OPTIONS_AVAILABLE,
+        "options_last_error": OPTIONS_LAST_ERROR,
+        "options_last_check": OPTIONS_LAST_CHECK
     })
 
 # ------------------------------------------------------------
@@ -1048,12 +1090,14 @@ def startup_message():
     skipped = ", ".join(
         a for _, a in REQUESTED if a not in contracts
     ) or "NONE"
+    option_status = "🟢 ACCESSIBLE" if OPTIONS_AVAILABLE else "🔴 UNAVAILABLE"
 
     telegram(
         f"""🟢 <b>{BOT_NAME} ONLINE</b>
 
 <b>Mode:</b> Crypto Options Signal Scanner
 <b>Timeframe:</b> 5 minutes
+<b>Options API:</b> {option_status}
 <b>Minimum score:</b> {MIN_SCORE}/10
 
 <b>ACTIVE OPTION UNDERLYINGS</b>
@@ -1085,12 +1129,17 @@ def main():
 
     discover_option_contracts()
 
-    for asset in contracts:
+    if not spot_symbols:
+        for name, asset in REQUESTED:
+            candidate = ALIASES.get(asset, [asset])[0].upper()
+            spot_symbols[asset] = candidate + "USDT"
+            asset_name[asset] = name
+
+    for asset in list(spot_symbols.keys()):
         try:
             print("Warmup", asset, load_history(asset))
         except Exception as e:
             print("Warmup failed", asset, e)
-
         time.sleep(0.10)
 
     threading.Thread(
